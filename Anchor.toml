@@ -1,0 +1,24 @@
+[toolchain]
+anchor_version = "1.0.2"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.devnet]
+holder_forum = "Eq1XL63knJE6UvdQJaWBTt2JrYzsgf3bdqafBkmb9XwG"
+
+[programs.localnet]
+holder_forum = "Eq1XL63knJE6UvdQJaWBTt2JrYzsgf3bdqafBkmb9XwG"
+
+[programs.mainnet]
+holder_forum = "Eq1XL63knJE6UvdQJaWBTt2JrYzsgf3bdqafBkmb9XwG"
+
+[provider]
+cluster = "devnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "echo skip"
+
+[hooks]

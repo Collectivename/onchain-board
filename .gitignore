@@ -1,0 +1,11 @@
+.anchor/
+target/
+test-ledger/
+.DS_Store
+node_modules/
+**/*.so
+packages/*/dist/
+
+# Program keypair created by `anchor build` — never commit.
+target/deploy/*.json
+!target/deploy/*.so
