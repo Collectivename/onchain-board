@@ -6,6 +6,7 @@ import {
   ARWEAVE_ID_RE,
   BOOTSTRAP_MIN_SOL,
   COMMENTS_PER_PAGE,
+  DELEGATION_PROGRAM_ID,
   ER_VALIDATORS,
   FORUM_CATEGORIES,
   MAX_FREE_UPLOAD_BYTES,
@@ -16,6 +17,7 @@ import {
   commentPagePda,
   createCommentIx,
   createPostIx,
+  dirtyPageIndexes,
   delegateCommentPageIx,
   delegatePostPageIx,
   encodePostTitle,
@@ -39,6 +41,7 @@ import { Markdown } from "./Markdown";
 import { MarkdownEditor } from "./MarkdownEditor";
 
 type SortMode = "hot" | "new" | "active";
+import { buildCommentTree, releaseBusyLock, takeBusyLock, type CommentNode } from "./thread";
 type EditorMode = "write" | "preview";
 
 const FEED_PAGE_SIZE = 8;
@@ -46,26 +49,30 @@ const COMMENT_ROOT_PAGE_SIZE = 6;
 
 type CommentNode = CommentRecord & { children: CommentNode[] };
 
-/** Embedded when replying to a comment so nesting works even if on-chain parent is 0 (legacy). */
+/** Old replies stored a parent id in the body. It is stripped for display. */
 const HF_PARENT_RE = /^<!--\s*hf:parent=(\d+)\s*-->\s*/;
-
-function extractParentHint(body: string): number | null {
-  const m = HF_PARENT_RE.exec(body);
-  return m ? Number(m[1]) : null;
-}
-
-function stripParentHint(body: string): string {
   return body.replace(HF_PARENT_RE, "");
 }
 
 function withParentHint(markdown: string, parentCommentId: number): string {
   return `<!--hf:parent=${parentCommentId}-->\n${markdown.trim()}`;
+async function waitUntilDelegated(routerUrl: string, address: PublicKey): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    const status = await getDelegationStatus(routerUrl, address);
+    if (status.isDelegated) return;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  throw new Error("The page is not on the rollup yet. Try again in a moment.");
 }
 
 function friendlyForumError(e: unknown): string {
   const raw = e instanceof Error ? e.message : String(e);
-  const insuf = raw.match(/insufficient lamports\s+(\d+),\s*need\s+(\d+)/i);
-  if (insuf) {
+  const stored = /text was stored/i.test(raw);
+  const message = friendlyForumErrorBody(stored ? raw.replace(/^.*did not land\.\s*/i, "") : raw);
+  return stored ? `The text was stored, but the transaction did not land. ${message}` : message;
+}
+
+function friendlyForumErrorBody(raw: string): string {
     const have = Number(insuf[1]) / 1e9;
     const need = Number(insuf[2]) / 1e9;
     return (
@@ -90,10 +97,30 @@ function friendlyForumError(e: unknown): string {
   if (/AccountOwnedByWrongProgram|0xbbf/i.test(raw)) {
     return (
       "A forum account is already owned by MagicBlock’s delegation program. " +
-      "Refresh the page — setup may already be complete."
+      "Refresh the page. Setup may already be complete."
     );
   }
   if (/blockhash not found/i.test(raw)) {
+    return (
+  if (/0x1770|NotAHolder/i.test(raw)) {
+    return "That wallet does not hold this token.";
+  }
+  if (/0x1772|TitleRequired/i.test(raw)) {
+    return "The title is empty.";
+  }
+  if (/0x1773|TitleTooLong/i.test(raw)) {
+    return "The title is longer than 96 bytes. Shorten it and try again.";
+  }
+  if (/0x1777|UnknownPost/i.test(raw)) {
+    return "That reply does not belong to this post.";
+  }
+  if (/0x1779|NothingToCommit/i.test(raw)) {
+    return "Nothing new to back up.";
+  }
+  if (/0x177a|CommitTooSoon/i.test(raw)) {
+    return "A backup already ran. The next one can run 6 hours after the last.";
+  }
+  if (/blockhash not found|block height exceeded/i.test(raw)) {
     return (
       "The wallet took too long or the send RPC did not recognize the blockhash. " +
       "Click Open forum again and approve promptly."
@@ -161,37 +188,6 @@ function plainPreview(md: string, max = 180): string {
   return `${plain.slice(0, max).trim()}…`;
 }
 
-function buildCommentTree(
-  list: CommentRecord[],
-  bodies: Record<string, string>
-): CommentNode[] {
-  const map = new Map<number, CommentNode>();
-  for (const c of list) map.set(c.id, { ...c, children: [] });
-  const roots: CommentNode[] = [];
-  for (const c of list) {
-    const node = map.get(c.id)!;
-    const body = bodies[c.arweaveId];
-    const hint = body ? extractParentHint(body) : null;
-    // Hint wins (needed when replying to legacy comment id 0 where on-chain parent is also 0).
-    // Otherwise parent_comment_id == 0 means top-level (reply to the post).
-    const parentId = hint != null ? hint : c.parentCommentId;
-    const nested = hint != null || c.parentCommentId !== 0;
-    if (nested && map.has(parentId)) {
-      map.get(parentId)!.children.push(node);
-    } else {
-      roots.push(node);
-    }
-  }
-  const sortRec = (nodes: CommentNode[]) => {
-    nodes.sort((a, b) => a.createdUnix - b.createdUnix);
-    for (const n of nodes) sortRec(n.children);
-  };
-  sortRec(roots);
-  return roots;
-}
-
-function indexStorageKey(programId: string, mint: string): string {
-  return `hf:index:${programId}:${mint}`;
 }
 
 function readStoredIndex(
@@ -396,6 +392,7 @@ export function HolderForum(props: HolderForumProps) {
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [thread, setThread] = useState<PostRecord | null>(null);
+  const busyLock = useRef(false);
   const threadRef = useRef(thread);
   threadRef.current = thread;
   const [comments, setComments] = useState<CommentRecord[]>([]);
@@ -464,7 +461,7 @@ export function HolderForum(props: HolderForumProps) {
 
   const commentTree = useMemo(() => buildCommentTree(comments, bodies), [comments, bodies]);
   const commentPageCount = Math.max(1, Math.ceil(commentTree.length / COMMENT_ROOT_PAGE_SIZE));
-  const pagedCommentRoots = useMemo(() => {
+  const commentTree = useMemo(() => buildCommentTree(comments), [comments]);
     const page = Math.min(commentPage, commentPageCount);
     const start = (page - 1) * COMMENT_ROOT_PAGE_SIZE;
     return commentTree.slice(start, start + COMMENT_ROOT_PAGE_SIZE);
@@ -495,11 +492,20 @@ export function HolderForum(props: HolderForumProps) {
 
   const applyIndex = useCallback(
     (idx: { forum: ForumAccount; posts: PostRecord[] } | null) => {
+  const confirmedRef = useRef(false);
+  const applyIndex = useCallback(
+    (idx: { forum: ForumAccount; posts: PostRecord[] } | null) => {
       setLoadError(null);
+      confirmedRef.current = true;
       setForum(idx ? idx.forum : null);
-      setPosts(idx?.posts ?? []);
-      if (idx && programId) {
-        writeStoredIndex(programId.toBase58(), mint.toBase58(), idx.forum, idx.posts);
+      setPosts((prev) => {
+        const incoming = idx?.posts ?? [];
+        if (!incoming.length) return [];
+        const oldestIncoming = Math.min(...incoming.map((p) => p.id));
+        const older = prev.filter((p) => p.id < oldestIncoming);
+        const seen = new Set(incoming.map((p) => p.id));
+        return [...incoming, ...older.filter((p) => !seen.has(p.id))];
+      });
       }
     },
     [programId, mint]
@@ -515,7 +521,11 @@ export function HolderForum(props: HolderForumProps) {
       } catch (e) {
         if (forum === undefined) {
           setLoadError(e instanceof Error ? e.message : "Could not reach Magic Router.");
+        if (!confirmedRef.current) {
+          setForum(undefined);
+          setPosts([]);
         }
+        setLoadError(e instanceof Error ? e.message : "Could not reach Magic Router.");
       }
     },
     [reader, applyIndex, forum]
@@ -531,11 +541,11 @@ export function HolderForum(props: HolderForumProps) {
       })
       .catch((e) => {
         if (cancelled) return;
-        if (forum === undefined) {
-          setLoadError(e instanceof Error ? e.message : "Could not reach Magic Router.");
+        if (!confirmedRef.current) {
+          setForum(undefined);
+          setPosts([]);
         }
-      });
-    return () => {
+        setLoadError(e instanceof Error ? e.message : "Could not reach Magic Router.");
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- boot once per reader
@@ -659,8 +669,11 @@ export function HolderForum(props: HolderForumProps) {
       const w = wallet();
       if (!w || !reader || !keys) {
         setErr("Connect a wallet that holds this token.");
+      if (!w || !reader || !keys) {
+        setErr("Connect a wallet that holds this token.");
         return;
       }
+      if (!takeBusyLock(busyLock)) return;
       setBusy(label);
       setErr(null);
       try {
@@ -669,8 +682,7 @@ export function HolderForum(props: HolderForumProps) {
       } catch (e) {
         setErr(friendlyForumError(e));
       } finally {
-        setBusy(null);
-      }
+        releaseBusyLock(busyLock);
     },
     [wallet, reader, keys, refresh]
   );
@@ -686,6 +698,8 @@ export function HolderForum(props: HolderForumProps) {
   const openThread = useCallback(
     async (p: PostRecord) => {
       if (!reader || !forum) return;
+    async (p: PostRecord, opts?: { quiet?: boolean }) => {
+      if (!reader || !forum) return;
       const switching = threadRef.current?.id !== p.id;
       setThread(p);
       if (switching) {
@@ -693,11 +707,20 @@ export function HolderForum(props: HolderForumProps) {
         setReplyTo(null);
         setInlineReply("");
       }
-      setThreadLoading(true);
-      setErr(null);
+      if (!opts?.quiet) {
+        setThreadLoading(true);
+        setErr(null);
+      }
       void loadBodies([p.arweaveId]);
       try {
-        const list = await reader.commentsForPost(p.id, forum);
+        if (opts?.quiet) reader.invalidatePages();
+        const pagePosts = await reader.getPostPage(pageIndexForPost(p.id));
+        const fresh = pagePosts.find((row) => row.id === p.id) ?? p;
+        const live = (await reader.readForum()) ?? forum;
+        const list = await reader.commentsForPost(fresh.id, live, fresh.commentCount);
+        if (fresh.commentCount !== p.commentCount) {
+          setThread((prev) => (prev && prev.id === fresh.id ? { ...prev, commentCount: fresh.commentCount } : prev));
+        }
         setComments((prev) => {
           const seen = new Set(list.map((c) => c.arweaveId));
           const pending = prev.filter((c) => c.arweaveId && !seen.has(c.arweaveId));
@@ -705,11 +728,9 @@ export function HolderForum(props: HolderForumProps) {
         });
         void loadBodies(list.map((c) => c.arweaveId));
       } catch (e) {
-        setErr(e instanceof Error ? e.message : "Could not load thread.");
+        if (!opts?.quiet) setErr(e instanceof Error ? e.message : "Could not load thread.");
       } finally {
-        setThreadLoading(false);
-      }
-    },
+        if (!opts?.quiet) setThreadLoading(false);
     [reader, forum, loadBodies]
   );
 
@@ -733,18 +754,15 @@ export function HolderForum(props: HolderForumProps) {
         });
       } else {
         try {
-          await sendForumTransaction({
-            connection: l1,
-            routerUrl: "",
-            wallet: w,
-            instructions: [delegatePostPageIx(keys, w.publicKey, page, validator)],
-          });
-        } catch {
-          // already delegated
-        }
+      } else if (!info.owner.equals(new PublicKey(DELEGATION_PROGRAM_ID))) {
+        await sendForumTransaction({
+          connection: l1,
+          routerUrl: "",
+          wallet: w,
+          instructions: [delegatePostPageIx(keys, w.publicKey, page, validator)],
+        });
       }
-      return page;
-    },
+      await waitUntilDelegated(props.routerUrl, addr);
     [keys, reader, validator, props.baseConnection]
   );
 
@@ -768,18 +786,15 @@ export function HolderForum(props: HolderForumProps) {
         });
       } else {
         try {
-          await sendForumTransaction({
-            connection: l1,
-            routerUrl: "",
-            wallet: w,
-            instructions: [delegateCommentPageIx(keys, w.publicKey, page, validator)],
-          });
-        } catch {
-          // already delegated
-        }
+      } else if (!info.owner.equals(new PublicKey(DELEGATION_PROGRAM_ID))) {
+        await sendForumTransaction({
+          connection: l1,
+          routerUrl: "",
+          wallet: w,
+          instructions: [delegateCommentPageIx(keys, w.publicKey, page, validator)],
+        });
       }
-      return page;
-    },
+      await waitUntilDelegated(props.routerUrl, addr);
     [keys, reader, validator, props.baseConnection]
   );
 
@@ -797,16 +812,27 @@ export function HolderForum(props: HolderForumProps) {
       const markdown = body.trim();
       const id = await props.uploadBody(markdown);
       rememberBody(id, markdown);
-      const page = await ensurePostPage(w, forum.postCount);
+      if (postTitleByteLength(composeCategory, title) > TITLE_MAX) {
+        throw new Error("The title is longer than 96 bytes. Shorten it and try again.");
+      }
+      reader.invalidate(true);
+      const live = await reader.readForum();
+      if (!live) throw new Error("Forum is not ready.");
+      const id = await props.uploadBody(markdown);
+      rememberBody(id, markdown);
+      const page = await ensurePostPage(w, live.postCount);
       const onChainTitle = encodePostTitle(composeCategory, title);
-      await sendForumTransaction({
-        connection: conn,
-        routerUrl: props.routerUrl,
-        wallet: w,
-        instructions: [createPostIx(keys!, w.publicKey, onChainTitle, id, page)],
-      });
-      reader.invalidatePages();
-      setTitle("");
+      try {
+        await sendForumTransaction({
+          connection: conn,
+          routerUrl: props.routerUrl,
+          wallet: w,
+          instructions: [createPostIx(keys!, w.publicKey, onChainTitle, id, page)],
+        });
+      } catch (e) {
+        const why = e instanceof Error ? e.message : String(e);
+        throw new Error(`The text was stored, but the transaction did not land. ${why}`);
+      }
       setBody("");
       setComposeOpen(false);
       setCategory(composeCategory);
@@ -821,35 +847,42 @@ export function HolderForum(props: HolderForumProps) {
         const trimmed = markdown.trim();
         // Nested replies always carry a body hint so threading survives legacy id=0 comments
         // (on-chain parent 0 == "reply to post", same as the first comment's id).
-        const payload =
-          parentCommentId != null ? withParentHint(trimmed, parentCommentId) : trimmed;
-        const id = await props.uploadBody(payload);
-        rememberBody(id, payload);
-        const cPage = await ensureCommentPage(w, forum.commentCount);
-        await sendForumTransaction({
-          connection: conn,
-          routerUrl: props.routerUrl,
-          wallet: w,
-          instructions: [
-            createCommentIx(
-              keys!,
-              w.publicKey,
-              thread.id,
-              parentCommentId ?? 0,
-              id,
-              pageIndexForPost(thread.id),
-              cPage
-            ),
-          ],
-        });
-        setComments((prev) => {
-          if (prev.some((c) => c.arweaveId === id)) return prev;
+        if (new TextEncoder().encode(trimmed).length > MAX_FREE_UPLOAD_BYTES) {
+          throw new Error("That reply is over the 100 KB limit.");
+        }
+        reader.invalidate(true);
+        const live = await reader.readForum();
+        if (!live) throw new Error("Forum is not ready.");
+        const id = await props.uploadBody(trimmed);
+        rememberBody(id, trimmed);
+        const cPage = await ensureCommentPage(w, live.commentCount);
+        try {
+          await sendForumTransaction({
+            connection: conn,
+            routerUrl: props.routerUrl,
+            wallet: w,
+            instructions: [
+              createCommentIx(
+                keys!,
+                w.publicKey,
+                thread.id,
+                parentCommentId ?? 0,
+                id,
+                pageIndexForPost(thread.id),
+                cPage
+              ),
+            ],
+          });
+        } catch (e) {
+          const why = e instanceof Error ? e.message : String(e);
+          throw new Error(`The text was stored, but the transaction did not land. ${why}`);
+        }
           return [
             ...prev,
             {
               id: forum.commentCount + 1,
               postId: thread.id,
-              parentCommentId: parentCommentId ?? 0,
+              id: live.commentCount + 1,
               author: w.publicKey.toBase58(),
               createdUnix: Math.floor(Date.now() / 1000),
               arweaveId: id,
@@ -874,6 +907,59 @@ export function HolderForum(props: HolderForumProps) {
 
   if (!programId) {
     return (
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const openedHash = useRef<number | null>(null);
+  const olderLock = useRef(false);
+  const loadOlder = useCallback(async () => {
+    if (!reader || posts.length === 0 || olderLock.current) return;
+    olderLock.current = true;
+    const oldest = Math.min(...posts.map((p) => p.id));
+    const page = Math.floor(oldest / POSTS_PER_PAGE);
+    if (page <= 0) {
+      olderLock.current = false;
+      return;
+    }
+    const from = Math.max(0, page - 6);
+    setLoadingOlder(true);
+    try {
+      const older = await reader.postsOnPages(from, page - 1);
+      setPosts((prev) => {
+        const seen = new Set(prev.map((p) => p.id));
+        return [...prev, ...older.filter((p) => !seen.has(p.id))];
+      });
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Could not load older posts.");
+    } finally {
+      olderLock.current = false;
+      setLoadingOlder(false);
+    }
+  }, [reader, posts]);
+
+  useEffect(() => {
+    if (!posts.length || typeof window === "undefined") return;
+    const match = /^#post-(\d+)$/.exec(window.location.hash);
+    if (!match) return;
+    const id = Number(match[1]);
+    const post = posts.find((p) => p.id === id);
+    if (post) {
+      if (openedHash.current === id && threadRef.current?.id === id) return;
+      openedHash.current = id;
+      void openThread(post);
+      return;
+    }
+    const oldest = Math.min(...posts.map((p) => p.id));
+    if (id < oldest) void loadOlder();
+  }, [posts, openThread, loadOlder]);
+
+  useEffect(() => {
+    if (!thread) return;
+    const id = window.setInterval(() => {
+      const current = threadRef.current;
+      if (current) void openThread(current, { quiet: true });
+    }, 8000);
+    return () => window.clearInterval(id);
+  }, [thread, openThread]);
+
       <div className="hf-forum hf-page">
         <div className="hf-card hf-empty">
           <p className="hf-post-title">Forum is not configured</p>
@@ -937,7 +1023,7 @@ export function HolderForum(props: HolderForumProps) {
           )}
           {canPost && needsMoreSol && (
             <p className="hf-err" style={{ marginTop: 8 }}>
-              Wallet has ~{solBalance!.toFixed(3)} SOL — need at least ~{BOOTSTRAP_MIN_SOL} SOL.
+              Wallet has ~{solBalance!.toFixed(3)} SOL. Need at least ~{BOOTSTRAP_MIN_SOL} SOL.
             </p>
           )}
           <button
@@ -948,7 +1034,7 @@ export function HolderForum(props: HolderForumProps) {
             onClick={() =>
               void run("Opening forum", async (w) => {
                 if (!props.baseConnection || !keys) {
-                  throw new Error("Base Solana connection missing — cannot open forum.");
+                  throw new Error("Base Solana connection missing. Cannot open forum.");
                 }
                 await bootstrapForum({
                   connection: props.baseConnection,
@@ -964,7 +1050,7 @@ export function HolderForum(props: HolderForumProps) {
           </button>
           {!props.baseConnection && (
             <p className="hf-err" style={{ marginTop: 8 }}>
-              Base Solana RPC is not wired — Open forum needs L1.
+              Base Solana RPC is not wired. Open forum needs L1.
             </p>
           )}
           {err && <p className="hf-err">{err}</p>}
@@ -1023,6 +1109,9 @@ export function HolderForum(props: HolderForumProps) {
         />
 
         <MarkdownEditor
+        {postTitleByteLength(composeCategory, title) > TITLE_MAX ? (
+          <p className="hf-err">Title is over 96 bytes. Shorten it.</p>
+        ) : null}
           value={body}
           onChange={setBody}
           mode={composeMode}
@@ -1048,7 +1137,12 @@ export function HolderForum(props: HolderForumProps) {
             disabled={
               !canPost || !title.trim() || !body.trim() || bodyBytes > MAX_FREE_UPLOAD_BYTES || Boolean(busy)
             }
-            onClick={submitPost}
+              !canPost ||
+              !title.trim() ||
+              !body.trim() ||
+              bodyBytes > MAX_FREE_UPLOAD_BYTES ||
+              postTitleByteLength(composeCategory, title) > TITLE_MAX ||
+              Boolean(busy)
           >
             {busy ?? "Post"}
           </button>
@@ -1064,9 +1158,7 @@ export function HolderForum(props: HolderForumProps) {
     const hint = bodyText ? extractParentHint(bodyText) : null;
     const parentId = hint != null ? hint : node.parentCommentId;
     const parent =
-      hint != null || node.parentCommentId !== 0 ? commentsById.get(parentId) : undefined;
-    const open = replyTo === node.id;
-
+      node.parentCommentId !== 0 ? commentsById.get(node.parentCommentId) : undefined;
     return (
       <div
         key={node.id}
@@ -1139,7 +1231,12 @@ export function HolderForum(props: HolderForumProps) {
                   className="hf-btn hf-btn-sm"
                   disabled={!canPost || !inlineReply.trim() || Boolean(busy)}
                   onClick={() =>
-                    postComment(inlineReply, node.id, () => {
+                  disabled={
+                !canPost ||
+                !inlineReply.trim() ||
+                new TextEncoder().encode(inlineReply.trim()).length > MAX_FREE_UPLOAD_BYTES ||
+                Boolean(busy)
+              }
                       setInlineReply("");
                       setReplyTo(null);
                     })
@@ -1152,8 +1249,10 @@ export function HolderForum(props: HolderForumProps) {
           )}
           {node.children.length > 0 && depth < maxDepth && (
             <div className="hf-cmt-kids">{node.children.map((ch) => renderComment(ch, depth + 1))}</div>
-          )}
-        </div>
+          {node.children.length > 0 && (
+            <div className="hf-cmt-kids">
+              {node.children.map((ch) => renderComment(ch, Math.min(depth + 1, maxDepth)))}
+            </div>
       </div>
     );
   };
@@ -1229,7 +1328,12 @@ export function HolderForum(props: HolderForumProps) {
               className="hf-btn"
               disabled={!canPost || !reply.trim() || Boolean(busy)}
               onClick={() =>
-                postComment(reply, null, () => {
+              disabled={
+                !canPost ||
+                !reply.trim() ||
+                new TextEncoder().encode(reply.trim()).length > MAX_FREE_UPLOAD_BYTES ||
+                Boolean(busy)
+              }
                   setReply("");
                   setReplyMode("write");
                 })
@@ -1317,6 +1421,9 @@ export function HolderForum(props: HolderForumProps) {
           </button>
         </div>
       </header>
+
+      <div className="hf-subnav" role="tablist" aria-label="Categories">
+      {loadError ? <p className="hf-err">{loadError}</p> : null}
 
       <div className="hf-subnav" role="tablist" aria-label="Categories">
         {FORUM_CATEGORIES.map((c) => (
@@ -1437,6 +1544,18 @@ export function HolderForum(props: HolderForumProps) {
                 );
               })}
             </ul>
+            {posts.length > 0 && Math.min(...posts.map((p) => p.id)) > 0 ? (
+              <div style={{ display: "flex", justifyContent: "center", marginTop: 12 }}>
+                <button
+                  type="button"
+                  className="hf-btn hf-btn-ghost"
+                  disabled={loadingOlder || Boolean(busy)}
+                  onClick={() => void loadOlder()}
+                >
+                  {loadingOlder ? "Loading older posts…" : "Older posts"}
+                </button>
+              </div>
+            ) : null}
             <Pager
               page={Math.min(feedPage, feedPageCount)}
               pageCount={feedPageCount}
@@ -1458,9 +1577,8 @@ export function HolderForum(props: HolderForumProps) {
         <summary>Durability tools</summary>
         <div className="hf-tools-body">
           <p className="hf-muted" style={{ margin: 0, fontSize: 12 }}>
-            Optional. Fund the commit treasury so MagicBlock can back up the index later.
-          </p>
-          <p className="hf-mono">{treasury}</p>
+            Optional. Fund the commit treasury on Solana, then back up the index. One backup
+            includes at most 16 post pages and 16 comment pages. The next backup waits 6 hours.
           <div className="hf-tools-actions">
             <button
               type="button"
@@ -1483,9 +1601,11 @@ export function HolderForum(props: HolderForumProps) {
                   void run("Funding treasury", async (w) => {
                     await sendForumTransaction({
                       connection: conn,
-                      routerUrl: props.routerUrl,
-                      wallet: w,
-                      instructions: [fundTreasuryIx(w.publicKey, new PublicKey(treasury), 2_000_000)],
+                    const l1 = props.baseConnection;
+                    if (!l1) throw new Error("Base Solana connection missing.");
+                    await sendForumTransaction({
+                      connection: l1,
+                      routerUrl: "",
                     });
                   })
                 }
@@ -1500,19 +1620,27 @@ export function HolderForum(props: HolderForumProps) {
               onClick={() =>
                 void run("Committing index", async (w) => {
                   const extras: PublicKey[] = [];
-                  if (forum.postCount > 0) {
-                    extras.push(
-                      postPagePda(programId, reader!.forum, pageIndexForPost(forum.postCount - 1))
-                    );
+                  // Oldest dirty pages first, and only a prefix. A later backup
+                  if (!reader) return;
+                  reader.invalidate(true);
+                  const live = await reader.readForum();
+                  if (!live) throw new Error("Forum is not ready.");
+                  const extras: PublicKey[] = [];
+                  const postPages = dirtyPageIndexes(
+                    live.lastCommittedPosts ?? 0,
+                    live.postCount,
+                    POSTS_PER_PAGE
+                  );
+                  const commentPages = dirtyPageIndexes(
+                    live.lastCommittedComments ?? 0,
+                    live.commentCount,
+                    COMMENTS_PER_PAGE
+                  );
+                  for (const idx of postPages.slice(0, 16)) {
+                    extras.push(postPagePda(programId, reader.forum, idx));
                   }
-                  if (forum.commentCount > 0) {
-                    extras.push(
-                      commentPagePda(
-                        programId,
-                        reader!.forum,
-                        pageIndexForComment(forum.commentCount - 1)
-                      )
-                    );
+                  for (const idx of commentPages.slice(0, 16)) {
+                    extras.push(commentPagePda(programId, reader.forum, idx));
                   }
                   await sendForumTransaction({
                     connection: conn,
@@ -1520,8 +1648,13 @@ export function HolderForum(props: HolderForumProps) {
                     wallet: w,
                     instructions: [maybeCommitIx(keys!, w.publicKey, validator, extras)],
                   });
-                })
-              }
+                  const left =
+                    Math.max(0, postPages.length - 16) + Math.max(0, commentPages.length - 16);
+                  if (left > 0) {
+                    setErr(
+                      `Backed up the first 16 pages of each kind. ${left} more page${left === 1 ? "" : "s"} wait for the next backup.`
+                    );
+                  }
             >
               {busy === "Committing index" ? busy : "Backup index"}
             </button>

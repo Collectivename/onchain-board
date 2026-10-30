@@ -1,4 +1,4 @@
-﻿import {
+import {
   PublicKey,
   SystemProgram,
   TransactionInstruction,
@@ -8,6 +8,7 @@ import { IX, concatBytes, encodeString, encodeU32, encodeU64 } from "./coder";
 import {
   DELEGATION_PROGRAM_ID,
   MAGIC_CONTEXT_ID,
+  COMMENTS_PER_PAGE,
   MAGIC_PROGRAM_ID,
 } from "./constants";
 import {
@@ -20,10 +21,16 @@ import {
   magicFeeVaultPda,
   postPagePda,
   treasuryPda,
+  validatorRecordPda,
 } from "./pda";
 
 function meta(pubkey: PublicKey, isSigner: boolean, isWritable: boolean): AccountMeta {
   return { pubkey, isSigner, isWritable };
+}
+
+/** web3.js instruction data is a Node Buffer. Encoding stays Uint8Array. */
+function ixData(bytes: Uint8Array): Buffer {
+  return Buffer.from(bytes);
 }
 
 function holderAccounts(
@@ -80,7 +87,7 @@ export function initializeIx(keys: ForumKeys, author: PublicKey): TransactionIns
   const treasury = treasuryPda(keys.programId, keys.mint);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: IX.initialize,
+    data: ixData(IX.initialize),
     keys: [
       ...holderAccounts(author, keys.mint, keys.tokenProgram),
       meta(forum, false, true),
@@ -90,6 +97,15 @@ export function initializeIx(keys: ForumKeys, author: PublicKey): TransactionIns
       meta(SystemProgram.programId, false, false),
     ],
   });
+}
+
+function delegateHolderTail(keys: ForumKeys, payer: PublicKey, validator?: PublicKey): AccountMeta[] {
+  return [
+    meta(associatedTokenAddress(keys.mint, payer, keys.tokenProgram), false, false),
+    meta(keys.tokenProgram, false, false),
+    meta(validatorRecordPda(keys.programId, keys.mint), false, true),
+    ...validatorRemaining(validator),
+  ];
 }
 
 function validatorRemaining(validator?: PublicKey): AccountMeta[] {
@@ -104,14 +120,14 @@ export function delegateForumIx(
   const forum = forumPda(keys.programId, keys.mint);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: IX.delegateForum,
+    data: ixData(IX.delegateForum),
     keys: [
       meta(payer, true, true),
       meta(keys.mint, false, false),
       ...delegateBufferTriplet(forum, keys.programId),
       meta(forum, false, true),
       ...delegateProgramTail(keys.programId),
-      ...validatorRemaining(validator),
+      ...delegateHolderTail(keys, payer, validator),
     ],
   });
 }
@@ -124,14 +140,14 @@ export function delegateTreasuryIx(
   const treasury = treasuryPda(keys.programId, keys.mint);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: IX.delegateTreasury,
+    data: ixData(IX.delegateTreasury),
     keys: [
       meta(payer, true, true),
       meta(keys.mint, false, false),
       ...delegateBufferTriplet(treasury, keys.programId),
       meta(treasury, false, true),
       ...delegateProgramTail(keys.programId),
-      ...validatorRemaining(validator),
+      ...delegateHolderTail(keys, payer, validator),
     ],
   });
 }
@@ -146,7 +162,7 @@ export function delegatePostPageIx(
   const page = postPagePda(keys.programId, forum, pageIndex);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: concatBytes(IX.delegatePostPage, encodeU32(pageIndex)),
+    data: ixData(concatBytes(IX.delegatePostPage, encodeU32(pageIndex))),
     keys: [
       meta(payer, true, true),
       meta(keys.mint, false, false),
@@ -154,7 +170,7 @@ export function delegatePostPageIx(
       ...delegateBufferTriplet(page, keys.programId),
       meta(page, false, true),
       ...delegateProgramTail(keys.programId),
-      ...validatorRemaining(validator),
+      ...delegateHolderTail(keys, payer, validator),
     ],
   });
 }
@@ -169,7 +185,7 @@ export function delegateCommentPageIx(
   const page = commentPagePda(keys.programId, forum, pageIndex);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: concatBytes(IX.delegateCommentPage, encodeU32(pageIndex)),
+    data: ixData(concatBytes(IX.delegateCommentPage, encodeU32(pageIndex))),
     keys: [
       meta(payer, true, true),
       meta(keys.mint, false, false),
@@ -177,7 +193,7 @@ export function delegateCommentPageIx(
       ...delegateBufferTriplet(page, keys.programId),
       meta(page, false, true),
       ...delegateProgramTail(keys.programId),
-      ...validatorRemaining(validator),
+      ...delegateHolderTail(keys, payer, validator),
     ],
   });
 }
@@ -205,7 +221,7 @@ export function openPostPageIx(
   const forum = forumPda(keys.programId, keys.mint);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: concatBytes(IX.openPostPage, encodeU32(pageIndex)),
+    data: ixData(concatBytes(IX.openPostPage, encodeU32(pageIndex))),
     keys: [
       ...holderAccounts(author, keys.mint, keys.tokenProgram),
       meta(forum, false, false),
@@ -223,7 +239,7 @@ export function openCommentPageIx(
   const forum = forumPda(keys.programId, keys.mint);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: concatBytes(IX.openCommentPage, encodeU32(pageIndex)),
+    data: ixData(concatBytes(IX.openCommentPage, encodeU32(pageIndex))),
     keys: [
       ...holderAccounts(author, keys.mint, keys.tokenProgram),
       meta(forum, false, false),
@@ -243,7 +259,7 @@ export function createPostIx(
   const forum = forumPda(keys.programId, keys.mint);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: concatBytes(IX.createPost, encodeString(title), encodeString(arweaveId)),
+    data: ixData(concatBytes(IX.createPost, encodeString(title), encodeString(arweaveId))),
     keys: [
       meta(author, true, false),
       meta(keys.mint, false, false),
@@ -265,23 +281,30 @@ export function createCommentIx(
   commentPageIndex: number
 ): TransactionInstruction {
   const forum = forumPda(keys.programId, keys.mint);
+  const accounts = [
+    meta(author, true, false),
+    meta(keys.mint, false, false),
+    meta(associatedTokenAddress(keys.mint, author, keys.tokenProgram), false, false),
+    meta(keys.tokenProgram, false, false),
+    meta(forum, false, true),
+    meta(postPagePda(keys.programId, forum, postPageIndex), false, true),
+    meta(commentPagePda(keys.programId, forum, commentPageIndex), false, true),
+  ];
+  if (parentCommentId > 0) {
+    const parentPage = Math.floor((parentCommentId - 1) / COMMENTS_PER_PAGE);
+    if (parentPage !== commentPageIndex) {
+      accounts.push(meta(commentPagePda(keys.programId, forum, parentPage), false, false));
+    }
+  }
   return new TransactionInstruction({
     programId: keys.programId,
-    data: concatBytes(
+    data: ixData(concatBytes(
       IX.createComment,
       encodeU64(postId),
       encodeU64(parentCommentId),
       encodeString(arweaveId)
-    ),
-    keys: [
-      meta(author, true, false),
-      meta(keys.mint, false, false),
-      meta(associatedTokenAddress(keys.mint, author, keys.tokenProgram), false, false),
-      meta(keys.tokenProgram, false, false),
-      meta(forum, false, true),
-      meta(postPagePda(keys.programId, forum, postPageIndex), false, true),
-      meta(commentPagePda(keys.programId, forum, commentPageIndex), false, true),
-    ],
+    )),
+    keys: accounts,
   });
 }
 
@@ -295,14 +318,15 @@ export function maybeCommitIx(
   const treasury = treasuryPda(keys.programId, keys.mint);
   return new TransactionInstruction({
     programId: keys.programId,
-    data: IX.maybeCommit,
+    data: ixData(concatBytes(IX.maybeCommit, validator.toBytes())),
     keys: [
       meta(caller, true, false),
       meta(forum, false, true),
       meta(treasury, false, true),
       meta(magicFeeVaultPda(validator), false, true),
-      meta(new PublicKey(MAGIC_CONTEXT_ID), false, true),
+      // #[commit] appends magic_program, then magic_context.
       meta(new PublicKey(MAGIC_PROGRAM_ID), false, false),
+      meta(new PublicKey(MAGIC_CONTEXT_ID), false, true),
       ...extraPages.map((p) => meta(p, false, true)),
     ],
   });

@@ -10,6 +10,7 @@ export const SEED_FORUM = Buffer.from("forum");
 export const SEED_TREASURY = Buffer.from("treasury");
 export const SEED_POSTS = Buffer.from("posts");
 export const SEED_COMMENTS = Buffer.from("comments");
+export const SEED_VALIDATOR = Buffer.from("validator");
 
 export const ATA_PROGRAM_ID = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 export const TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";

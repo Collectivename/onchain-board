@@ -27,6 +27,31 @@ function writableKeys(ixs: TransactionInstruction[]): PublicKey[] {
   return out;
 }
 
+async function confirmHttp(
+  connection: Connection,
+  signature: string,
+  lastValidBlockHeight: number
+): Promise<void> {
+  for (let i = 0; i < 45; i++) {
+    const status = await connection.getSignatureStatuses([signature]);
+    const row = status.value[0];
+    if (row?.err) {
+      throw new Error(`Transaction failed: ${JSON.stringify(row.err)}`);
+    }
+    if (row?.confirmationStatus === "confirmed" || row?.confirmationStatus === "finalized") {
+      return;
+    }
+    if (lastValidBlockHeight > 0) {
+      const height = await connection.getBlockHeight("confirmed").catch(() => 0);
+      if (height > lastValidBlockHeight) {
+        throw new Error(`Signature ${signature} has expired: block height exceeded`);
+      }
+    }
+    await new Promise((r) => setTimeout(r, 800));
+  }
+  throw new Error(`Signature ${signature} was not confirmed`);
+}
+
 function isStaleBlockhash(err: unknown): boolean {
   const raw = err instanceof Error ? err.message : String(err);
   return /blockhash not found|block height exceeded|expired/i.test(raw);
@@ -80,25 +105,20 @@ export async function sendForumTransaction(opts: {
     tx.recentBlockhash = latest.blockhash;
 
     const signed = await opts.wallet.signTransaction(tx);
+    let sig: string;
     try {
-      const sig = await opts.connection.sendRawTransaction(signed.serialize(), {
+      sig = await opts.connection.sendRawTransaction(signed.serialize(), {
         skipPreflight: false,
         preflightCommitment: "confirmed",
       });
-      const confirm =
-        latest.lastValidBlockHeight > 0
-          ? {
-              signature: sig,
-              blockhash: signed.recentBlockhash ?? latest.blockhash,
-              lastValidBlockHeight: latest.lastValidBlockHeight,
-            }
-          : sig;
-      await opts.connection.confirmTransaction(confirm, "confirmed");
-      return sig;
     } catch (err) {
       lastErr = err;
       if (!isStaleBlockhash(err) || attempt === 1) break;
+      continue;
     }
+    // A signature already exists. Poll it. Do not sign a second copy.
+    await confirmHttp(opts.connection, sig, latest.lastValidBlockHeight);
+    return sig;
   }
 
   throw lastErr;

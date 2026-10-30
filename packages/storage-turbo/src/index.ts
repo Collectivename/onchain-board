@@ -14,8 +14,10 @@ export const BODY_MISS_TTL_MS = 4_000;
 const TURBO_GATEWAY = "https://turbo-gateway.com";
 const ARWEAVE_L1 = "https://arweave.net";
 const GATEWAYS = [TURBO_GATEWAY, ARWEAVE_L1] as const;
+const ALLOWED_HOSTS = new Set(GATEWAYS.map((base) => new URL(base).host));
 const RACE_MS = 2_000;
 const FRESH_ATTEMPTS = 4;
+const MAX_REDIRECTS = 3;
 
 export type JsonWebKeyLike = Record<string, unknown>;
 
@@ -85,19 +87,69 @@ function rememberHit(id: string, text: string): void {
   hitCache.set(id, text);
 }
 
+function allowedGateway(url: URL): boolean {
+  return url.protocol === "https:" && ALLOWED_HOSTS.has(url.host);
+}
+
+/** Stop after the free-upload cap so a random id cannot pull an unbounded file. */
+async function readCapped(res: Response, max: number): Promise<string> {
+  const declared = Number(res.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > max) {
+    throw new Error("body too large");
+  }
+  if (!res.body) {
+    const text = await res.text();
+    if (byteLength(text) > max) throw new Error("body too large");
+    return text;
+  }
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > max) throw new Error("body too large");
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(out);
+}
+
 async function getFromGateway(
   base: string,
   id: string,
   signal: AbortSignal
 ): Promise<string> {
-  const res = await fetch(`${base.replace(/\/$/, "")}/${id}`, {
-    redirect: "follow",
-    signal,
-    // Never cache 404s in Next’s Data Cache — a miss is not the final body.
-    cache: "no-store",
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.text();
+  let url = new URL(`${base.replace(/\/$/, "")}/${id}`);
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    if (!allowedGateway(url)) throw new Error("redirect off gateway");
+    const res = await fetch(url, {
+      redirect: "manual",
+      signal,
+      // Never cache 404s in Next’s Data Cache — a miss is not the final body.
+      cache: "no-store",
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get("location");
+      if (!loc || hop === MAX_REDIRECTS) throw new Error("redirect off gateway");
+      url = new URL(loc, url);
+      continue;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return readCapped(res, MAX_FREE_UPLOAD_BYTES);
+  }
+  throw new Error("redirect off gateway");
 }
 
 /** First Arweave gateway to return 200 wins. */

@@ -76,7 +76,7 @@ export async function bootstrapForum(opts: {
     const after = await connection.getAccountInfo(forum, "confirmed");
     if (!after?.data?.length) {
       throw new Error(
-        "Forum open did not land. Nothing was created (rent was not kept) — try again."
+        "Forum open did not land. Nothing was created (rent was not kept). Try again."
       );
     }
     return { mode: "full" };
@@ -115,7 +115,7 @@ export async function bootstrapForum(opts: {
     const info = await connection.getAccountInfo(step.account, "confirmed");
     if (!info) {
       throw new Error(
-        `Forum account "${step.label}" is missing. Cannot finish setup — contact support.`
+        `Forum account "${step.label}" is missing. Cannot finish setup. Contact support.`
       );
     }
     if (await isDelegated(step.account, info.owner)) continue;

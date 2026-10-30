@@ -9,23 +9,30 @@ license = "MIT"
 crate-type = ["cdylib", "lib"]
 name = "holder_forum"
 
-# Full Anchor feature set so macros' cfg checks stop warning (Solana Foundation
-# Anchor v1 migration §7 + MagickBlock/bolt program Cargo.toml pattern).
+# Kept so `anchor build --features idl-build` still configures. This crate is
+# not an Anchor program; the instruction bytes are fixed in src/lib.rs.
 [features]
 no-entrypoint = []
 no-idl = []
 no-log-ix-name = []
-cpi = ["no-entrypoint"]
+cpi = []
 default = []
-idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
-anchor-debug = ["anchor-lang/anchor-debug"]
-custom-heap = []
-custom-panic = []
+idl-build = []
 
 [dependencies]
-# MagicBlock's documented stack (Anchor guide + ephemeral-rollups-sdk 0.16).
-# See forum/README.md. Pin these when you `anchor build`.
-anchor-lang = { version = "1.0.2", features = ["init-if-needed"] }
-anchor-spl = "1.0.2"
-ephemeral-rollups-sdk = { version = "0.16.2", features = ["anchor"] }
-bytemuck = { version = "1.20.0", features = ["min_const_generics"] }
+# Pinocchio instead of Anchor. Same instruction and account bytes, without
+# Anchor's generated checkers or the MagicBlock SDK's unused intent variants.
+pinocchio = { version = "0.10", default-features = false, features = ["alloc", "cpi"] }
+pinocchio-system = "0.5"
+bytemuck = { version = "1.20.0", features = ["derive", "min_const_generics"] }
+
+# Host tests call `Address::try_find_program_address`. That software path is
+# feature-gated off the SBF target, so curve25519 stays out of the program.
+[target.'cfg(not(any(target_os = "solana", target_arch = "bpf", target_arch = "sbf")))'.dependencies]
+solana-address = { version = "2.0", features = ["curve25519"] }
+
+[dev-dependencies]
+bincode = "1.3.3"
+borsh = "1.5"
+magicblock-magic-program-api = "0.10.1"
+sha2 = "0.10"

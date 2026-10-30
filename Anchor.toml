@@ -6,16 +6,16 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-holder_forum = "Eq1XL63knJE6UvdQJaWBTt2JrYzsgf3bdqafBkmb9XwG"
+holder_forum = "DC8Jfe955jYJUiCm1SmtadgmZCbLisXHVAUsgvw7jp5W"
 
 [programs.localnet]
-holder_forum = "Eq1XL63knJE6UvdQJaWBTt2JrYzsgf3bdqafBkmb9XwG"
+holder_forum = "DC8Jfe955jYJUiCm1SmtadgmZCbLisXHVAUsgvw7jp5W"
 
 [programs.mainnet]
-holder_forum = "Eq1XL63knJE6UvdQJaWBTt2JrYzsgf3bdqafBkmb9XwG"
+holder_forum = "DC8Jfe955jYJUiCm1SmtadgmZCbLisXHVAUsgvw7jp5W"
 
 [provider]
-cluster = "devnet"
+cluster = "mainnet"
 wallet = "~/.config/solana/id.json"
 
 [scripts]

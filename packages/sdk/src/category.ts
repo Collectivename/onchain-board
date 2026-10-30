@@ -28,10 +28,28 @@ const PREFIX: Record<ForumCategory, string> = {
   proposal: "P|",
 };
 
+function clipUtf8(value: string, maxBytes: number): string {
+  const enc = new TextEncoder();
+  if (enc.encode(value).length <= maxBytes) return value;
+  let out = "";
+  for (const ch of value) {
+    const next = out + ch;
+    if (enc.encode(next).length > maxBytes) break;
+    out = next;
+  }
+  return out;
+}
+
+export function postTitleByteLength(category: ForumCategory, title: string): number {
+  const p = PREFIX[category];
+  const body = title.trim().replace(/^\s*[GP]\|/i, "");
+  return new TextEncoder().encode(`${p}${body}`).length;
+}
+
 export function encodePostTitle(category: ForumCategory, title: string): string {
   const p = PREFIX[category];
   const body = title.trim().replace(/^\s*[GP]\|/i, "");
-  return `${p}${body.slice(0, TITLE_MAX - p.length)}`;
+  return clipUtf8(`${p}${body}`, TITLE_MAX);
 }
 
 export function parsePostTitle(raw: string): { category: ForumCategory; title: string } {

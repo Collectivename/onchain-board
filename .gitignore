@@ -6,6 +6,6 @@ node_modules/
 **/*.so
 packages/*/dist/
 
-# Program keypair created by `anchor build` — never commit.
+# Program keypair and compiled .so stay local. Never commit either.
 target/deploy/*.json
-!target/deploy/*.so
+target/deploy/*.so

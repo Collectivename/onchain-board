@@ -52,6 +52,7 @@ export class ForumReader {
   private failover: Connection | null = null;
   private readonly cache = new Map<string, CacheEntry<unknown>>();
   private readonly inflight = new Map<string, Promise<unknown>>();
+  private generation = 0;
 
   constructor(opts: ForumReaderOpts) {
     this.programId = opts.programId;
@@ -69,6 +70,8 @@ export class ForumReader {
 
   /** Drop volatile caches but keep long-lived page payloads when soft=true. */
   invalidate(soft = false): void {
+    this.generation += 1;
+    this.inflight.clear();
     if (!soft) {
       this.cache.clear();
       return;
@@ -96,13 +99,14 @@ export class ForumReader {
     if (hit && Date.now() - hit.at < this.ttl) return Promise.resolve(hit.value as T);
     const pending = this.inflight.get(key);
     if (pending) return pending as Promise<T>;
+    const gen = this.generation;
     const p = load()
       .then((value) => {
-        this.cache.set(key, { at: Date.now(), value });
+        if (gen === this.generation) this.cache.set(key, { at: Date.now(), value });
         return value;
       })
       .finally(() => {
-        this.inflight.delete(key);
+        if (this.inflight.get(key) === p) this.inflight.delete(key);
       });
     this.inflight.set(key, p);
     return p;
@@ -131,12 +135,13 @@ export class ForumReader {
   }
 
   async getForum(): Promise<ForumAccount | null> {
-    return this.cached("forum", async () => {
-      const acc = await this.withFailover((c) =>
-        c.getAccountInfo(this.forum, this.commitment)
-      );
-      return this.decodeForumAcc(acc);
-    });
+    return this.cached("forum", async () => this.readForum(this.commitment));
+  }
+
+  /** Uncached read. Page selection uses `confirmed` so a stale `processed` view cannot target a full page. */
+  async readForum(commitment: Commitment = "confirmed"): Promise<ForumAccount | null> {
+    const acc = await this.withFailover((c) => c.getAccountInfo(this.forum, commitment));
+    return this.decodeForumAcc(acc);
   }
 
   async getPostPage(pageIndex: number): Promise<PostRecord[]> {
@@ -240,19 +245,38 @@ export class ForumReader {
    * Load comments for a post. Fetches every comment page in **one** multi-get
    * (pages are cached), then filters client-side by postId.
    */
-  async commentsForPost(postId: number, forum: ForumAccount): Promise<CommentRecord[]> {
+  /**
+   * Comments for one post. Walks newest pages first and stops once the post's
+   * own comment count is collected, so a recent thread does not pull every page.
+   */
+  async commentsForPost(
+    postId: number,
+    forum: ForumAccount,
+    expectedCount = 0
+  ): Promise<CommentRecord[]> {
+    if (expectedCount <= 0) return [];
     const last = Math.max(
       0,
       Math.max(forum.commentPageCount, Math.ceil(forum.commentCount / COMMENTS_PER_PAGE) || 1) - 1
     );
-    const pages = await this.getCommentPages(0, last);
     const out: CommentRecord[] = [];
-    for (const page of pages) {
-      for (const cmt of page) {
+    for (let page = last; page >= 0 && out.length < expectedCount; page--) {
+      const [records] = await this.getCommentPages(page, page);
+      for (const cmt of records ?? []) {
         if (cmt.postId === postId) out.push(cmt);
       }
     }
     return out.sort((a, b) => a.id - b.id);
+  }
+
+  /** Post pages `[from, to]` inclusive, for the history pager. */
+  async postsOnPages(from: number, to: number): Promise<PostRecord[]> {
+    if (to < from) return [];
+    const pages = await this.getMultiplePostPages(from, to);
+    const posts: PostRecord[] = [];
+    for (const page of pages) posts.push(...page);
+    posts.sort((a, b) => b.id - a.id);
+    return posts;
   }
 
   async getCommentPages(from: number, to: number): Promise<CommentRecord[][]> {
@@ -308,6 +332,16 @@ export class ForumReader {
 
 export function pageIndexForPost(postId: number): number {
   return Math.floor(postId / POSTS_PER_PAGE);
+}
+
+/** Page indexes that still need a commit, oldest first. Empty when nothing is dirty. */
+export function dirtyPageIndexes(committed: number, total: number, perPage: number): number[] {
+  if (!(total > committed) || perPage <= 0) return [];
+  const start = Math.floor(committed / perPage);
+  const end = Math.floor((total - 1) / perPage);
+  const out: number[] = [];
+  for (let i = start; i <= end; i++) out.push(i);
+  return out;
 }
 
 export function pageIndexForComment(commentId: number): number {

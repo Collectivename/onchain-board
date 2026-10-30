@@ -10,6 +10,7 @@ import {
   SEED_MAGIC_FEE_VAULT,
   SEED_POSTS,
   SEED_TREASURY,
+  SEED_VALIDATOR,
 } from "./constants";
 
 export function forumPda(programId: PublicKey, mint: PublicKey): PublicKey {
@@ -18,6 +19,11 @@ export function forumPda(programId: PublicKey, mint: PublicKey): PublicKey {
 
 export function treasuryPda(programId: PublicKey, mint: PublicKey): PublicKey {
   return PublicKey.findProgramAddressSync([SEED_TREASURY, mint.toBuffer()], programId)[0];
+}
+
+/** Solana-side record of the validator chosen by the first holder delegate. */
+export function validatorRecordPda(programId: PublicKey, mint: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync([SEED_VALIDATOR, mint.toBuffer()], programId)[0];
 }
 
 export function u32le(n: number): Buffer {
