@@ -14,7 +14,8 @@ export const BODY_MISS_TTL_MS = 4_000;
 const TURBO_GATEWAY = "https://turbo-gateway.com";
 const ARWEAVE_L1 = "https://arweave.net";
 const GATEWAYS = [TURBO_GATEWAY, ARWEAVE_L1] as const;
-const ALLOWED_HOSTS = new Set(GATEWAYS.map((base) => new URL(base).host));
+/** Apex hosts. Gateways 302 the bytes onto a data-node subdomain of the same site. */
+const ALLOWED_HOSTS = GATEWAYS.map((base) => new URL(base).host);
 const RACE_MS = 2_000;
 const FRESH_ATTEMPTS = 4;
 const MAX_REDIRECTS = 3;
@@ -88,7 +89,9 @@ function rememberHit(id: string, text: string): void {
 }
 
 function allowedGateway(url: URL): boolean {
-  return url.protocol === "https:" && ALLOWED_HOSTS.has(url.host);
+  if (url.protocol !== "https:") return false;
+  const host = url.hostname.toLowerCase();
+  return ALLOWED_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
 }
 
 /** Stop after the free-upload cap so a random id cannot pull an unbounded file. */
